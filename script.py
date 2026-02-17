@@ -63,6 +63,71 @@ def load_creds(path: Path):
     return cfg['credentials'] if 'credentials' in cfg else {}
 
 
+def load_preferences(path: Path):
+    """Load saved booking preferences from config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+
+    if 'preferences' not in cfg:
+        return {'desired_dates': [], 'preferred_sessions': []}
+
+    prefs = cfg['preferences']
+
+    # Parse saved dates (format: "01/01/2026,02/01/2026,...")
+    saved_dates_str = prefs.get('desired_dates', '')
+    desired_dates = []
+    if saved_dates_str:
+        try:
+            for date_str in saved_dates_str.split(','):
+                date_str = date_str.strip()
+                if date_str:
+                    desired_dates.append(
+                        datetime.strptime(date_str, '%d/%m/%Y'))
+        except ValueError as e:
+            print(f"[Config] Error parsing saved dates: {e}")
+
+    # Parse saved sessions (format: "1,2,3,4,5")
+    saved_sessions_str = prefs.get('preferred_sessions', '')
+    preferred_sessions = []
+    if saved_sessions_str:
+        try:
+            preferred_sessions = [
+                int(s.strip()) for s in saved_sessions_str.split(',') if s.strip()]
+        except ValueError as e:
+            print(f"[Config] Error parsing saved sessions: {e}")
+
+    return {
+        'desired_dates': desired_dates,
+        'preferred_sessions': preferred_sessions
+    }
+
+
+def save_preferences(path: Path, desired_dates, preferred_sessions):
+    """Save booking preferences to config file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+
+    if 'preferences' not in cfg:
+        cfg['preferences'] = {}
+
+    # Format dates as "01/01/2026,02/01/2026,..."
+    dates_str = ','.join([d.strftime('%d/%m/%Y') for d in desired_dates])
+    cfg['preferences']['desired_dates'] = dates_str
+
+    # Format sessions as "1,2,3,4,5"
+    sessions_str = ','.join(str(s) for s in sorted(set(preferred_sessions)))
+    cfg['preferences']['preferred_sessions'] = sessions_str
+
+    with path.open('w') as f:
+        cfg.write(f)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+    print("[Config] Preferences saved")
+
+
 def handle_cloudflare_challenge(driver, max_retries=3):
     """
     Handle Cloudflare challenge with seleniumbase.
@@ -297,71 +362,109 @@ def main():
         # handle_cloudflare_challenge(driver)
         # driver.sleep(2)
 
-        # Booking conditions - date selection
+        # Booking conditions - collect user preferences with caching
         print("[Booking] Gathering booking preferences...")
-        while True:
-            input_date = input("Enter date (eg. 01 Jan 2020): ")
-            date_pref = input("Do you want to enable 7 day range (y/n): ")
-            present = datetime.now()
-            date_list_actual = []
 
-            if date_pref == "y":
-                try:
-                    test_date = datetime.strptime(input_date, '%d %b %Y')
-                    date_list = [test_date +
-                                 timedelta(days=x) for x in range(7)]
-                    for d in date_list:
-                        if d.date() < present.date():
-                            print("Invalid date please try again")
-                            continue
-                        else:
-                            base_date = d.strftime('%#d/%#m/%Y')
-                            date_list_actual.append(base_date)
+        # Load previously saved preferences
+        saved_prefs = load_preferences(cfg_path)
+        saved_desired_dates = saved_prefs['desired_dates']
+        saved_preferred_sessions = saved_prefs['preferred_sessions']
+
+        desired_dates = []
+        preferred_sessions = []
+
+        # Check if we have saved preferences and ask user
+        if saved_desired_dates or saved_preferred_sessions:
+            print("\nPreviously saved preferences found:")
+            if saved_desired_dates:
+                print(
+                    f"  Dates: {[d.strftime('%d %b %Y') for d in saved_desired_dates]}")
+            if saved_preferred_sessions:
+                print(f"  Sessions: {sorted(saved_preferred_sessions)}")
+
+            while True:
+                use_saved = input(
+                    "\nDo you want to use the same preferences? (yes/no): ").lower()
+                if use_saved in ('yes', 'y'):
+                    desired_dates = saved_desired_dates
+                    preferred_sessions = saved_preferred_sessions
+                    print("[Booking] Using saved preferences")
                     break
-                except ValueError:
-                    print("Wrong date format")
-                    continue
-
-            elif date_pref == "n":
-                try:
-                    test_date = datetime.strptime(input_date, '%d %b %Y')
-                    if test_date < present:
-                        print("Invalid date please try again")
-                        continue
-                except ValueError:
-                    print("Wrong date format")
-                    continue
+                elif use_saved in ('no', 'n'):
+                    print("[Booking] Will prompt for new preferences")
+                    break
                 else:
-                    id_date = test_date.strftime('%#d/%#m/%Y')
-                    break
-            else:
-                print("Invalid input please enter y/n")
-                continue
+                    print("Please enter 'yes' or 'no'")
 
-        # Session number selection
-        id_list = []
-        while True:
-            try:
-                x = [int(x) for x in input(
-                    "Enter your session number (1-6 separated by whitespace): ").split()]
-                for a in x:
-                    if a < 1 or a > 6:
-                        print("Enter valid numbers")
+        # If not using saved preferences or none exist, prompt for new ones
+        if not desired_dates:
+            # Get desired dates
+            while True:
+                date_input = input(
+                    "Enter a date you want to book (eg. 01 Jan 2026), or 'done' to finish: ")
+                if date_input.lower() == 'done':
+                    if not desired_dates:
+                        print("Please enter at least one date")
                         continue
-                    elif date_pref == "n":
-                        id = str(a) + "_" + id_date
-                        id_list.append(id)
-                    elif date_pref == "y":
-                        for id_date in date_list_actual:
-                            id = str(a) + "_" + id_date
-                            id_list.append(id)
-                break
-            except ValueError:
-                print("Enter valid numbers")
-                continue
+                    break
+                try:
+                    test_date = datetime.strptime(date_input, '%d %b %Y')
+                    present = datetime.now()
+                    if test_date.date() < present.date():
+                        print("Invalid date - cannot book in the past")
+                        continue
+                    desired_dates.append(test_date)
+                    print(f"Added date: {date_input}")
+                except ValueError:
+                    print("Wrong date format, please use 'dd Mon YYYY' format")
+                    continue
+
+            print(
+                f"Desired dates: {[d.strftime('%d %b %Y') for d in desired_dates]}")
+
+        if not preferred_sessions:
+            # Get preferred session timings
+            print("\nAvailable sessions:")
+            print(
+                "Weekdays (Mon-Fri): 1=8:00am, 2=9:50am, 3=12:15pm, 4=2:05pm, 5=3:55pm, 6=6:20pm, 7=8:10pm")
+            print("Weekends (Sat-Sun): 1=8:00am, 2=9:50am, 3=12:15pm, 4=2:05pm, 5=3:55pm")
+
+            while True:
+                session_input = input(
+                    "Enter preferred session numbers (1-7 separated by spaces), or 'done' to finish: ")
+                if session_input.lower() == 'done':
+                    if not preferred_sessions:
+                        print("Please enter at least one session")
+                        continue
+                    break
+                try:
+                    sessions = [int(x) for x in session_input.split()]
+                    valid = True
+                    for s in sessions:
+                        if s < 1 or s > 7:
+                            print(
+                                f"Invalid session number: {s}. Please enter 1-7")
+                            valid = False
+                            break
+                    if valid:
+                        preferred_sessions.extend(sessions)
+                        preferred_sessions = list(set(preferred_sessions))
+                        print(
+                            f"Preferred sessions: {sorted(preferred_sessions)}")
+                        break
+                except ValueError:
+                    print("Please enter valid numbers separated by spaces")
+                    continue
+
+        print(f"\n[Booking] Preferences set:")
+        print(f"  Dates: {[d.strftime('%d %b %Y') for d in desired_dates]}")
+        print(f"  Sessions: {sorted(preferred_sessions)}")
+
+        # Save preferences for next time
+        save_preferences(cfg_path, desired_dates, preferred_sessions)
 
         # Solve CAPTCHA before form submission
-        print("[Booking] Solving CAPTCHA for booking form...")
+        print("\n[Booking] Solving CAPTCHA for booking form...")
         try:
             driver.solve_captcha()
             print("[Booking] CAPTCHA solved")
@@ -371,94 +474,264 @@ def main():
 
         driver.sleep(1)
 
-        # Fill in date and location
-        location = "Woodlands"
-        print("[Booking] Filling in booking form...")
-        driver.type("#SelectedDate", input_date)
-        driver.select_option_by_value("#SelectedLocation", location)
-        driver.sleep(1)
+        # Click "Get The Earliest Date" button
+        # Click "Get The Earliest Date" button with infinite retry logic for fully booked slots
+        print("[Booking] Attempting to get earliest available date...")
+        print("[Booking] Bot will keep retrying until an available date is found or script is stopped...")
+        import random
+        retry_count = 0
+        earliest_date_obtained = False
 
-        # Click "Check for Availability" button
-        print("[Booking] Checking for availability...")
-        driver.uc_click("#btn_checkforava")
-        driver.sleep(3)
-
-        # Handle Cloudflare challenge on availability check
-        handle_cloudflare_challenge(driver)
-        driver.sleep(2)
-
-        # Booking loop - find and book available slots
-        print("[Booking] Starting slot booking loop...")
-        booking_attempt_count = 0
-        max_attempts = 50
-
-        while len(id_list) != 0 and booking_attempt_count < max_attempts:
-            booking_attempt_count += 1
+        while not earliest_date_obtained:
+            retry_count += 1
             print(
-                f"[Booking] Attempt {booking_attempt_count}: Looking for {len(id_list)} slots")
-
+                f"\n[Booking] Attempt {retry_count}: Clicking 'Get The Earliest Date' button...")
             try:
-                driver.scroll_to(0, 800)
+                driver.uc_click("#button-searchDate")
+                driver.sleep(2)
 
-                # Build XPath for available slots
-                booking_conditions = " or ".join(
-                    [f"contains(@id, '{keyword}')" for keyword in id_list]
-                )
-                expression = f"//*[{booking_conditions}]"
+                # Check for "All the slots are Fully Booked" pop-up
+                fully_booked = False
+                try:
+                    # Try to detect the fully booked message
+                    driver.assert_text(
+                        "All the slots are Fully Booked", timeout=2)
+                    fully_booked = True
+                except Exception:
+                    # Message not found, assume table is loading or will appear
+                    pass
 
-                # Find the booking slot
-                driver.wait_for_element(expression, timeout=5)
-                slot_id = driver.get_attribute(expression, "id")
-
-                # Remove booked slot from list
-                for id in id_list[:]:
-                    if id in slot_id:
-                        id_list.remove(id)
-                        print(f"[Booking] Found slot: {slot_id}")
-
-                # Click on the slot
-                driver.uc_click(expression)
-                driver.sleep(1)
-
-                # Wait for confirmation modal and close it
-                driver.wait_for_element(
-                    "//div[@class='modal-footer']/button[1]", timeout=10)
-                driver.click("//div[@class='modal-footer']/button[1]")
-
-                # Send confirmation email if enabled
-                msg.set_content(
-                    f'A class of id {slot_id} has been booked, please login to confirm your booking within 40 mins'
-                )
-                if email_pref == "y" and EMAIL_ADDRESS:
+                if fully_booked:
+                    print(
+                        "[Booking] Pop-up detected: All slots are fully booked. Closing pop-up...")
+                    # Click on the "Close" button in the pop-up
                     try:
-                        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-                            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-                            smtp.send_message(msg)
-                        print(f"[Email] Confirmation sent to {EMAIL_ADDRESS}")
-                    except Exception as e:
-                        print(f"[Email] Failed to send email: {e}")
+                        # Try multiple selectors for the close button
+                        close_button_found = False
+                        close_selectors = [
+                            "button:contains('Close')",
+                            "//button[contains(text(), 'Close')]",
+                            "//div[@class='modal-footer']/button[1]",
+                            "button[data-dismiss='modal']"
+                        ]
 
-                # If more slots to book, refresh and continue
-                if len(id_list) != 0:
-                    driver.uc_click("#btn_checkforava")
-                    driver.sleep(2)
-                    handle_cloudflare_challenge(driver)
-                    driver.sleep(1)
+                        for selector in close_selectors:
+                            try:
+                                driver.uc_click(selector)
+                                close_button_found = True
+                                print(
+                                    "[Booking] Close button clicked successfully")
+                                break
+                            except Exception:
+                                continue
+
+                        if not close_button_found:
+                            print(
+                                "[Booking] Warning: Could not find close button, proceeding with wait anyway")
+                    except Exception as close_e:
+                        print(
+                            f"[Booking] Error clicking close button: {close_e}")
+
+                    wait_time = random.randint(15, 30)
+                    print(
+                        f"[Booking] Waiting {wait_time} seconds before retrying...")
+                    driver.sleep(wait_time)
+                    continue
+                else:
+                    # No fully booked message, assume we got a date
+                    print("[Booking] Earliest date obtained successfully")
+                    earliest_date_obtained = True
+                    break
 
             except Exception as e:
-                print(
-                    f"[Booking] Exception on attempt {booking_attempt_count}: {e}")
-                # Refresh page and retry
-                driver.refresh()
+                print(f"[Booking] Error during Get Earliest Date attempt: {e}")
+                wait_time = random.randint(10, 20)
+                print(f"[Booking] Retrying in {wait_time} seconds...")
+                driver.sleep(wait_time)
+
+        # Check if the dropdown date matches any of the desired dates
+        print("[Booking] Checking lesson date...")
+        lesson_date_found = False
+
+        try:
+            lesson_date_value = driver.get_value("#SelectedDate")
+            print(
+                f"[Booking] Current lesson date in dropdown: {lesson_date_value}")
+
+            # Parse the lesson date and check if it's in desired dates
+            try:
+                lesson_date = datetime.strptime(lesson_date_value, '%d/%m/%Y')
+
+                for desired_date in desired_dates:
+                    if lesson_date.date() == desired_date.date():
+                        lesson_date_found = True
+                        print(
+                            f"[Booking] Lesson date {lesson_date_value} matches desired date!")
+                        break
+            except ValueError as e:
+                print(f"[Booking] Error parsing lesson date: {e}")
+        except Exception as e:
+            print(f"[Booking] Error reading lesson date: {e}")
+
+        if not lesson_date_found:
+            print(
+                f"[Booking] Lesson date does not match any desired dates. Skipping availability check.")
+        else:
+            # Click "Check for Availability" button
+            print("[Booking] Clicking 'Check for Availability' button...")
+            try:
+                driver.uc_click("#btn_checkforava")
                 driver.sleep(2)
+
+                # Handle Cloudflare challenge if needed
                 handle_cloudflare_challenge(driver)
                 driver.sleep(1)
 
-        if len(id_list) == 0:
-            print("[Success] All sessions booked successfully!")
-        else:
-            print(
-                f"[Warning] Booking loop ended with {len(id_list)} slots still remaining")
+                # Now a table should be displayed with available slots
+                print(
+                    "[Booking] Table loaded. Searching for available slots matching user preferences...")
+
+                booked_count = 0
+                max_bookings = 20
+
+                # Parse the availability table in a structured way
+                try:
+                    # Wait for the table header to be present
+                    driver.wait_for_element("//table//thead", timeout=5)
+
+                    # Read session numbers from the header (skip first 'Session Date' col)
+                    header_elems = driver.find_elements("//table//thead//th")
+                    session_numbers = []
+                    if len(header_elems) > 1:
+                        for he in header_elems[1:]:
+                            txt = he.text.strip()
+                            try:
+                                # header usually contains the session number (e.g. '1')
+                                num = int(txt.split()[0])
+                            except Exception:
+                                # fallback: extract digits
+                                digits = ''.join(
+                                    [c for c in txt if c.isdigit()])
+                                try:
+                                    num = int(digits) if digits else None
+                                except Exception:
+                                    num = None
+                            session_numbers.append(num)
+
+                    # Iterate rows (each row is a date)
+                    rows = driver.find_elements("//table//tbody//tr")
+                    print(f"[Booking] Found {len(rows)} date rows in table")
+
+                    for r_idx, _ in enumerate(rows, start=1):
+                        try:
+                            # Extract the date shown in the row (from the <th><a> element)
+                            date_xpath = f"//table//tbody//tr[{r_idx}]//th//a"
+                            try:
+                                date_text = driver.find_element(
+                                    date_xpath).text.strip()
+                            except Exception:
+                                # If not found, skip this row
+                                continue
+
+                            try:
+                                row_date = datetime.strptime(
+                                    date_text, '%d %b %Y')
+                            except Exception:
+                                print(
+                                    f"[Booking] Could not parse row date '{date_text}'")
+                                continue
+
+                            # Only consider rows that match desired_dates
+                            if not any(row_date.date() == d.date() for d in desired_dates):
+                                continue
+
+                            # Iterate each session column in this row
+                            tds = driver.find_elements(
+                                f"//table//tbody//tr[{r_idx}]//td")
+                            for col_idx, td in enumerate(tds, start=1):
+                                try:
+                                    td_text = td.text.strip().lower()
+                                except Exception:
+                                    td_text = ''
+
+                                # Skip 'n/a' or empty cells
+                                if 'n/a' in td_text or td_text == '':
+                                    continue
+
+                                # Map column index to session number (if parsed from header)
+                                session_num = None
+                                if session_numbers and col_idx <= len(session_numbers):
+                                    session_num = session_numbers[col_idx - 1]
+                                else:
+                                    session_num = col_idx
+
+                                # Skip if this session number is not in preferred_sessions
+                                if preferred_sessions and session_num not in preferred_sessions:
+                                    print(
+                                        f"[Booking] Slot available for session {session_num} on {date_text}, but not preferred")
+                                    continue
+
+                                # Build xpath for this cell and attempt to click it (prefer link inside cell)
+                                cell_xpath = f"//table//tbody//tr[{r_idx}]//td[{col_idx}]"
+                                try:
+                                    try:
+                                        driver.uc_click(cell_xpath + "//a")
+                                    except Exception:
+                                        driver.uc_click(cell_xpath)
+
+                                    driver.sleep(0.5)
+
+                                    # Handle confirmation modal if it appears
+                                    try:
+                                        driver.wait_for_element(
+                                            "//div[@class='modal-footer']/button[1]", timeout=5)
+                                        driver.click(
+                                            "//div[@class='modal-footer']/button[1]")
+                                        booked_count += 1
+                                        print(
+                                            f"[Booking] Booking confirmed! ({booked_count} total) for {date_text} session {session_num}")
+
+                                        # Send confirmation email if enabled
+                                        msg.set_content(
+                                            f'A car lesson slot has been booked. Please login to confirm your booking within 40 mins.'
+                                        )
+                                        if email_pref == "y" and EMAIL_ADDRESS:
+                                            try:
+                                                with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                                                    smtp.login(
+                                                        EMAIL_ADDRESS, EMAIL_PASSWORD)
+                                                    smtp.send_message(msg)
+                                                print(
+                                                    f"[Email] Confirmation sent to {EMAIL_ADDRESS}")
+                                            except Exception as e:
+                                                print(
+                                                    f"[Email] Failed to send email: {e}")
+                                    except Exception as modal_e:
+                                        print(
+                                            f"[Booking] No confirmation modal or booking failed: {modal_e}")
+
+                                except Exception as click_e:
+                                    print(
+                                        f"[Booking] Error clicking session cell: {click_e}")
+
+                                if booked_count >= max_bookings:
+                                    break
+
+                            if booked_count >= max_bookings:
+                                break
+
+                    if booked_count > 0:
+                        print(
+                            f"\n[Success] Successfully booked {booked_count} slot(s)!")
+                    else:
+                        print(
+                            "[Booking] No suitable slots found matching your preferences.")
+
+                except Exception as e:
+                    print(f"[Booking] Error parsing availability table: {e}")
+
+            except Exception as e:
+                print(f"[Booking] Error during availability check: {e}")
 
 
 if __name__ == "__main__":
